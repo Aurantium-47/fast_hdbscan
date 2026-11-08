@@ -4,6 +4,7 @@ import numpy as np
 from .disjoint_set import ds_rank_create, ds_find, ds_union_by_rank
 from .numba_kdtree import (
     NumbaKDTreeType,
+    NumbaKDTreeType64,
     parallel_tree_query,
     rdist,
     point_to_node_lower_bound_rdist,
@@ -15,7 +16,8 @@ from .variables import NUMBA_CACHE
 @numba.njit(locals={"parent": numba.types.int32}, cache=NUMBA_CACHE)
 def select_components(candidate_distances, candidate_neighbors, point_components):
     component_edges = {
-        np.int64(0): (np.int32(0), np.int32(1), np.float32(0.0)) for i in range(0)
+        np.int64(0): (np.int32(0), np.int32(1), candidate_distances.dtype.type(0.0))
+        for i in range(0)
     }
 
     # Find the best edges from each component
@@ -36,7 +38,12 @@ def merge_components(
     disjoint_set, candidate_neighbors, candidate_neighbor_distances, point_components
 ):
     component_edges = {
-        np.int64(0): (np.int64(0), np.int64(1), np.float32(0.0)) for i in range(0)
+        np.int64(0): (
+            np.int64(0),
+            np.int64(1),
+            candidate_neighbor_distances.dtype.type(0.0),
+        )
+        for i in range(0)
     }
 
     # Find the best edges from each component
@@ -125,28 +132,41 @@ def update_component_vectors(tree, disjoint_set, node_components, point_componen
 
 
 @numba.njit(
-    numba.void(
-        NumbaKDTreeType,
-        numba.int32,
-        numba.float32[::1],
-        numba.float32[::1],
-        numba.int32[::1],
-        numba.float32,
-        numba.types.Array(numba.float32, 1, "A"),
-        numba.int64,
-        numba.int64[::1],
-        numba.int64[::1],
-        numba.float32,
-        numba.float32[::1],
-    ),
+    [
+        numba.void(
+            NumbaKDTreeType,
+            numba.int32,
+            numba.float32[::1],
+            numba.float32[::1],
+            numba.int32[::1],
+            numba.float32,
+            numba.types.Array(numba.float32, 1, "A"),
+            numba.int64,
+            numba.int64[::1],
+            numba.int64[::1],
+            numba.float32,
+            numba.float32[::1],
+        ),
+        numba.void(
+            NumbaKDTreeType64,
+            numba.int32,
+            numba.float64[::1],
+            numba.float64[::1],
+            numba.int32[::1],
+            numba.float64,
+            numba.types.Array(numba.float64, 1, "A"),
+            numba.int64,
+            numba.int64[::1],
+            numba.int64[::1],
+            numba.float64,
+            numba.float64[::1],
+        ),
+    ],
     locals={
         "i": numba.types.int32,
         "idx": numba.types.int32,
         "left": numba.types.int32,
         "right": numba.types.int32,
-        "d": numba.types.float32,
-        "dist_lower_bound_left": numba.types.float32,
-        "dist_lower_bound_right": numba.types.float32,
     },
     cache=NUMBA_CACHE,
     fastmath=True,
@@ -288,23 +308,19 @@ def component_aware_query_recursion(
 
 
 @numba.njit(
-    locals={
-        "i": numba.types.int32,
-        "distance_lower_bound": numba.types.float32,
-        "current_component": numba.types.int32,
-    },
+    locals={"i": numba.types.int32, "current_component": numba.types.int32},
     parallel=True,
     cache=NUMBA_CACHE,
     fastmath=True,
 )
 def boruvka_tree_query(tree, node_components, point_components, core_distances):
-    candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
+    candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=tree.data.dtype)
     candidate_indices = np.full(tree.data.shape[0], -1, dtype=np.int32)
     component_nearest_neighbor_dist = np.full(
-        tree.data.shape[0], np.inf, dtype=np.float32
+        tree.data.shape[0], np.inf, dtype=tree.data.dtype
     )
 
-    data = tree.data.astype(np.float32)
+    data = tree.data
 
     for i in numba.prange(tree.data.shape[0]):
         distance_lower_bound = point_to_node_lower_bound_rdist(
@@ -354,15 +370,7 @@ def calculate_block_size(n_components, n_points, num_threads):
 
 
 @numba.njit(
-    [
-        "void(float32[:], float32[:], int32[:], int32, int32)",
-        "void(float64[:], float64[:], int64[:], int64, int64)",
-    ],
-    locals={
-        "i": numba.types.int32,
-        "component": numba.types.int32,
-        "block_bound": numba.types.float32,
-    },
+    locals={"i": numba.types.int32, "component": numba.types.int32},
     cache=NUMBA_CACHE,
     fastmath=True,
     inline="always",
@@ -383,19 +391,11 @@ def update_component_bounds_from_block(
 
 
 @numba.njit(
-    numba.types.Tuple((numba.float32[::1], numba.int32[::1]))(
-        NumbaKDTreeType,
-        numba.int64[::1],
-        numba.int64[::1],
-        numba.types.Array(numba.float32, 1, "A"),
-        numba.int64,
-    ),
     locals={
         "block_start": numba.types.int32,
         "block_end": numba.types.int32,
         "block_size_actual": numba.types.int32,
         "i": numba.types.int32,
-        "distance_lower_bound": numba.types.float32,
         "current_component": numba.types.int32,
     },
     parallel=True,
@@ -406,16 +406,16 @@ def boruvka_tree_query_reproducible(
     tree, node_components, point_components, core_distances, block_size
 ):
     """Reproducible version using block-based processing to avoid race conditions."""
-    candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
+    candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=tree.data.dtype)
     candidate_indices = np.full(tree.data.shape[0], -1, dtype=np.int32)
     component_nearest_neighbor_dist = np.full(
-        tree.data.shape[0], np.inf, dtype=np.float32
+        tree.data.shape[0], np.inf, dtype=tree.data.dtype
     )
 
-    data = tree.data.astype(np.float32)
+    data = tree.data
 
     # Reusable buffer for block component bounds (allocate once, reuse)
-    max_block_component_bounds = np.full(block_size, np.inf, dtype=np.float32)
+    max_block_component_bounds = np.full(block_size, np.inf, dtype=tree.data.dtype)
 
     # Process points in blocks
     for block_start in range(0, tree.data.shape[0], block_size):
@@ -486,7 +486,7 @@ def boruvka_tree_query_reproducible(
 def initialize_boruvka_from_knn(
     knn_indices, knn_distances, core_distances, disjoint_set
 ):
-    # component_edges = {0:(np.int32(0), np.int32(1), np.float32(0.0)) for i in range(0)}
+    # component_edges = {0:(np.int32(0), np.int32(1), candidate_distances.dtype.type(0.0)) for i in range(0)}
     component_edges = np.full((knn_indices.shape[0], 3), -1, dtype=np.float64)
 
     for i in numba.prange(knn_indices.shape[0]):
@@ -526,7 +526,7 @@ def initialize_boruvka_from_knn(
 
 @numba.njit(parallel=True, cache=NUMBA_CACHE)
 def sample_weight_core_distance(distances, neighbors, sample_weights, min_samples):
-    core_distances = np.zeros(distances.shape[0], dtype=np.float32)
+    core_distances = np.zeros(distances.shape[0], dtype=distances.dtype)
     for i in numba.prange(distances.shape[0]):
         total_weight = 0.0
         j = 0
@@ -539,16 +539,7 @@ def sample_weight_core_distance(distances, neighbors, sample_weights, min_sample
     return core_distances
 
 
-@numba.njit(
-    numba.types.Tuple((numba.float64[:, ::1], numba.int32[:, :], numba.float32[::1]))(
-        NumbaKDTreeType,
-        numba.int64,
-        numba.int64,
-        numba.float32[::1],
-        numba.types.boolean,
-    ),
-    cache=NUMBA_CACHE,
-)
+@numba.njit(cache=NUMBA_CACHE)
 def parallel_boruvka(
     tree,
     n_threads,
@@ -589,7 +580,7 @@ def parallel_boruvka(
                 tree, components_disjoint_set, node_components, point_components
             )
         else:
-            core_distances = np.zeros(tree.data.shape[0], dtype=np.float32)
+            core_distances = np.zeros(tree.data.shape[0], dtype=tree.data.dtype)
             distances, neighbors = parallel_tree_query(
                 tree, tree.data, k=2, output_rdist=True
             )

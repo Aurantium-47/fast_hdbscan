@@ -33,6 +33,21 @@ NumbaKDTreeType = numba.types.NamedTuple(
 )
 
 
+# Recursive kernels need explicit specializations for reliable Numba cache reloads.
+NumbaKDTreeType64 = numba.types.NamedTuple(
+    [
+        numba.types.float64[:, ::1],
+        numba.types.intp[::1],
+        numba.types.intp[::1],
+        numba.types.intp[::1],
+        numba.types.float64[::1],
+        numba.types.bool_[::1],
+        numba.types.float64[:, :, ::1],
+    ],
+    NumbaKDTree,
+)
+
+
 def kdtree_to_numba(sklearn_kdtree):
     data, idx_array, node_data, node_bounds = sklearn_kdtree.get_arrays()
 
@@ -64,18 +79,7 @@ def kdtree_to_numba(sklearn_kdtree):
     )
 
 
-@numba.njit(
-    cache=NUMBA_CACHE,
-    fastmath=True,
-    locals={
-        "n_features": numba.types.intp,
-        "lower_bounds": numba.types.float32[::1],
-        "upper_bounds": numba.types.float32[::1],
-        "radius": numba.types.float32,
-        "diff": numba.types.float32,
-        "data_row": numba.types.float32[::1],
-    },
-)
+@numba.njit(cache=NUMBA_CACHE, fastmath=True, locals={"n_features": numba.types.intp})
 def _init_node(
     data,
     node_bounds,
@@ -104,9 +108,9 @@ def _init_node(
             lower_bounds[j] = min(lower_bounds[j], data_row[j])
             upper_bounds[j] = max(upper_bounds[j], data_row[j])
 
-    radius = 0.0
+    radius = data.dtype.type(0.0)
     for j in range(n_features):
-        diff = abs(upper_bounds[j] - lower_bounds[j]) * 0.5
+        diff = data.dtype.type(abs(upper_bounds[j] - lower_bounds[j]) * 0.5)
         radius += diff * diff
 
     idx_start_array[node] = idx_start
@@ -116,24 +120,18 @@ def _init_node(
 
 
 @numba.njit(
-    "intp(float32[:,::1], intp[::1], intp, intp)",
     cache=NUMBA_CACHE,
     locals={
         "n_features": numba.types.intp,
         "result": numba.types.intp,
-        "max_spread": numba.types.float32,
         "j": numba.types.intp,
         "i": numba.types.intp,
-        "max_val": numba.types.float32,
-        "min_val": numba.types.float32,
-        "val": numba.types.float32,
-        "spread": numba.types.float32,
     },
 )
 def _find_node_split_dim(data, idx_array, idx_start, idx_end):
     n_features = data.shape[1]
     result = 0
-    max_spread = 0
+    max_spread = data.dtype.type(0)
 
     for j in range(n_features):
         max_val = data[idx_array[idx_start], j]
@@ -152,15 +150,7 @@ def _find_node_split_dim(data, idx_array, idx_start, idx_end):
     return result
 
 
-@numba.njit(
-    "int8(float32[:,::1], intp, intp, intp)",
-    fastmath=True,
-    cache=NUMBA_CACHE,
-    locals={
-        "val1": numba.types.float32,
-        "val2": numba.types.float32,
-    },
-)
+@numba.njit(fastmath=True, cache=NUMBA_CACHE, locals={})
 def _compare_indices(data, axis, idx1, idx2):
     val1 = data[idx1, axis]
     val2 = data[idx2, axis]
@@ -180,14 +170,9 @@ def _compare_indices(data, axis, idx1, idx2):
 
 
 @numba.njit(
-    "void(float32[:,::1], intp[::1], intp, intp, intp)",
     fastmath=True,
     cache=NUMBA_CACHE,
-    locals={
-        "i": numba.types.intp,
-        "key_idx": numba.types.intp,
-        "j": numba.types.intp,
-    },
+    locals={"i": numba.types.intp, "key_idx": numba.types.intp, "j": numba.types.intp},
 )
 def _insertion_sort_indices(data, idx_array, axis, left, right):
     for i in range(left + 1, right):
@@ -202,7 +187,6 @@ def _insertion_sort_indices(data, idx_array, axis, left, right):
 
 
 @numba.njit(
-    "void(float32[:,::1], intp[::1], intp, intp, intp, intp)",
     fastmath=True,
     cache=NUMBA_CACHE,
     locals={
@@ -245,14 +229,7 @@ def _sift_down_indices(data, idx_array, axis, offset, start, end):
         root = swap
 
 
-@numba.njit(
-    "void(float32[:,::1], intp[::1], intp, intp, intp)",
-    cache=NUMBA_CACHE,
-    locals={
-        "size": numba.types.intp,
-        "i": numba.types.intp,
-    },
-)
+@numba.njit(cache=NUMBA_CACHE, locals={"size": numba.types.intp, "i": numba.types.intp})
 def _heapsort_indices(data, idx_array, axis, left, right):
     size = right - left
 
@@ -267,7 +244,6 @@ def _heapsort_indices(data, idx_array, axis, left, right):
 
 
 @numba.njit(
-    "intp(float32[:,::1], intp[::1], intp, intp, intp)",
     fastmath=True,
     cache=NUMBA_CACHE,
     locals={
@@ -300,11 +276,9 @@ def _median_of_three_pivot(data, idx_array, axis, left, right):
 
 
 @numba.njit(
-    "intp(float32[:,::1], intp[::1], intp, intp, intp, intp)",
     fastmath=True,
     cache=NUMBA_CACHE,
     locals={
-        "pivot_value": numba.types.float32,
         "pivot_original_idx": numba.types.intp,
         "i": numba.types.intp,
         "j": numba.types.intp,
@@ -351,12 +325,8 @@ def _partition_indices(data, idx_array, axis, left, right, pivot_idx):
 
 
 @numba.njit(
-    "void(float32[:,::1], intp[::1], intp, intp, intp, intp, intp)",
     cache=NUMBA_CACHE,
-    locals={
-        "pivot_idx": numba.types.intp,
-        "pivot_pos": numba.types.intp,
-    },
+    locals={"pivot_idx": numba.types.intp, "pivot_pos": numba.types.intp},
 )
 def _introselect_impl(data, idx_array, axis, left, right, nth, depth_limit):
     while right - left > 16:
@@ -387,12 +357,7 @@ def _introselect_impl(data, idx_array, axis, left, right, nth, depth_limit):
 
 
 @numba.njit(
-    "void(float32[:,::1], intp[::1], intp, intp, intp, intp)",
-    cache=NUMBA_CACHE,
-    locals={
-        "size": numba.types.intp,
-        "max_depth": numba.types.intp,
-    },
+    cache=NUMBA_CACHE, locals={"size": numba.types.intp, "max_depth": numba.types.intp}
 )
 def _introselect(data, idx_array, axis, left, right, nth):
     size = right - left
@@ -408,7 +373,10 @@ def _introselect(data, idx_array, axis, left, right, nth):
 
 
 @numba.njit(
-    "void(float32[:, ::1], intp[::1], intp[::1], intp[::1], float32[::1], bool_[::1], float32[:, :, ::1], intp, intp, intp)",
+    [
+        "void(float32[:, ::1], intp[::1], intp[::1], intp[::1], float32[::1], bool_[::1], float32[:, :, ::1], intp, intp, intp)",
+        "void(float64[:, ::1], intp[::1], intp[::1], intp[::1], float64[::1], bool_[::1], float64[:, :, ::1], intp, intp, intp)",
+    ],
     cache=NUMBA_CACHE,
 )
 def _recursive_build_tree(
@@ -476,9 +444,16 @@ def _recursive_build_tree(
 
 
 def build_kdtree(data, leaf_size=40):
+    """Build a tree without discarding float64 coordinate precision.
+
+    Float32 inputs retain the existing single-precision kernels. Other inputs
+    use double precision. The tree owns its coordinate array in either case.
+    """
     n_samples = data.shape[0]
     n_features = data.shape[1]
-    data = data.astype(np.float32)
+    data = data.astype(
+        np.float32 if data.dtype == np.float32 else np.float64, order="C"
+    )
 
     if leaf_size < 1:
         raise ValueError("leaf_size must be greater than or equal to 1")
@@ -493,9 +468,9 @@ def build_kdtree(data, leaf_size=40):
     idx_array = np.arange(n_samples, dtype=np.intp)
     idx_start_array = np.zeros(n_nodes, dtype=np.intp)
     idx_end_array = np.zeros(n_nodes, dtype=np.intp)
-    radius_array = np.zeros(n_nodes, dtype=np.float32)
+    radius_array = np.zeros(n_nodes, dtype=data.dtype)
     is_leaf_array = np.zeros(n_nodes, dtype=np.bool_)
-    node_bounds = np.zeros((2, n_nodes, n_features), dtype=np.float32)
+    node_bounds = np.zeros((2, n_nodes, n_features), dtype=data.dtype)
 
     _recursive_build_tree(
         data,
@@ -522,53 +497,35 @@ def build_kdtree(data, leaf_size=40):
 
 
 @numba.njit(
-    [
-        "f4(f4[::1],f4[::1])",
-        "f8(f8[::1],f8[::1])",
-        "f8(f4[::1],f8[::1])",
-    ],
     fastmath=True,
-    locals={
-        "dim": numba.types.intp,
-        "i": numba.types.uint16,
-        "diff": numba.types.float32,
-        "result": numba.types.float32,
-    },
+    locals={"dim": numba.types.intp, "i": numba.types.uint16},
     cache=NUMBA_CACHE,
 )
 def rdist(x, y):
-    result = 0.0
+    result = x.dtype.type(0.0)
     dim = x.shape[0]
     for i in range(dim):
-        diff = x[i] - y[i]
+        diff = x.dtype.type(x[i] - y[i])
         result += diff * diff
 
     return result
 
 
 @numba.njit(
-    [
-        "f4(f4[::1],f4[::1],f4[::1])",
-        "f4(f8[::1],f8[::1],f4[::1])",
-        "f4(f8[::1],f8[::1],f8[::1])",
-    ],
     fastmath=True,
-    locals={
-        "dim": numba.types.intp,
-        "i": numba.types.uint16,
-        "d_lo": numba.types.float32,
-        "d_hi": numba.types.float32,
-        "d": numba.types.float32,
-        "result": numba.types.float32,
-    },
+    locals={"dim": numba.types.intp, "i": numba.types.uint16},
     cache=NUMBA_CACHE,
 )
 def point_to_node_lower_bound_rdist(upper, lower, pt):
-    result = 0.0
+    result = pt.dtype.type(0.0)
     dim = pt.shape[0]
     for i in range(dim):
-        d_lo = upper[i] - pt[i] if upper[i] > pt[i] else 0.0
-        d_hi = pt[i] - lower[i] if pt[i] > lower[i] else 0.0
+        d_lo = (
+            pt.dtype.type(upper[i] - pt[i]) if upper[i] > pt[i] else pt.dtype.type(0.0)
+        )
+        d_hi = (
+            pt.dtype.type(pt[i] - lower[i]) if pt[i] > lower[i] else pt.dtype.type(0.0)
+        )
         d = d_lo + d_hi
         result += d * d
 
@@ -576,10 +533,6 @@ def point_to_node_lower_bound_rdist(upper, lower, pt):
 
 
 @numba.njit(
-    [
-        "i4(f4[::1],i4[::1],f4,i4)",
-        "i4(f8[::1],i4[::1],f8,i4)",
-    ],
     fastmath=True,
     locals={
         "size": numba.types.intp,
@@ -678,27 +631,34 @@ def deheap_sort(distances, indices):
 
 
 @numba.njit(
-    numba.void(
-        NumbaKDTreeType,
-        numba.types.intp,
-        numba.float32[::1],
-        numba.float32[::1],
-        numba.int32[::1],
-        numba.float32,
-    ),
+    [
+        numba.void(
+            NumbaKDTreeType,
+            numba.types.intp,
+            numba.float32[::1],
+            numba.float32[::1],
+            numba.int32[::1],
+            numba.float32,
+        ),
+        numba.void(
+            NumbaKDTreeType64,
+            numba.types.intp,
+            numba.float64[::1],
+            numba.float64[::1],
+            numba.int32[::1],
+            numba.float64,
+        ),
+    ],
     fastmath=True,
     locals={
         "node": numba.types.intp,
         "left": numba.types.intp,
         "right": numba.types.intp,
-        "d": numba.types.float32,
         "idx": numba.types.uint32,
         "idx_start": numba.types.intp,
         "idx_end": numba.types.intp,
         "is_leaf": numba.types.boolean,
         "i": numba.types.intp,
-        "dist_lower_bound_left": numba.types.float32,
-        "dist_lower_bound_right": numba.types.float32,
     },
     cache=NUMBA_CACHE,
 )
@@ -763,17 +723,13 @@ def tree_query_recursion(
 
 
 @numba.njit(
-    parallel=True,
-    fastmath=True,
-    cache=NUMBA_CACHE,
-    locals={
-        "i": numba.types.intp,
-        "distance_lower_bound": numba.types.float32,
-    },
+    parallel=True, fastmath=True, cache=NUMBA_CACHE, locals={"i": numba.types.intp}
 )
 def parallel_tree_query(tree, data, k=10, output_rdist=False):
+    # Query points use the tree precision; matching C-order arrays are reused.
+    data = np.ascontiguousarray(np.asarray(data, dtype=tree.data.dtype))
     result = (
-        np.full((data.shape[0], k), np.inf, dtype=np.float32),
+        np.full((data.shape[0], k), np.inf, dtype=tree.data.dtype),
         np.full((data.shape[0], k), -1, dtype=np.int32),
     )
 
